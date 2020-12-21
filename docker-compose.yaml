@@ -1,0 +1,17 @@
+version: '2'
+
+services:
+
+  nfsen:
+    build: nfsen-ng
+    ports:
+    - 81:80
+    volumes:
+    - ./profiles-data:/var/nfdump/profiles-data
+
+  nfdump:
+    build: nfdump
+    ports:
+    - 9995:9995/udp
+    volumes:
+    - ./profiles-data:/data
