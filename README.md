@@ -13,4 +13,4 @@ Docker setup for running nfsen-ng (Netflow visualizer) and nfdump (Netflow/Sflow
 2. docker-compose up -d
 3. browse to http://localhost:81
 
-=> additonnaly, you may add/remove new lines in sources.conf... you just need to restart the stack by issuing 'docker-compose restart'
+=> additonnaly, you may add/remove lines in sources.conf... you just need to restart the stack by issuing 'docker-compose restart'
