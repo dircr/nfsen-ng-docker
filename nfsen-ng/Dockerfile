@@ -11,7 +11,7 @@ RUN echo "extension=rrd.so" >> /usr/local/etc/php/conf.d/rrd.ini
 RUN sed -e '/<Directory \/var\/www\/>/,/<\/Directory>/s/AllowOverride None/AllowOverride All/' -i /etc/apache2/apache2.conf
 
 RUN git clone https://github.com/mbolli/nfsen-ng.git .
-COPY settings.php backend/settings/
+COPY settings.php backend/settings/settings.tmpl
 COPY entrypoint.sh /tmp/
 
 RUN chown -R www-data:www-data .
