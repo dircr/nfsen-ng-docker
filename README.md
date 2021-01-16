@@ -20,7 +20,11 @@ Docker setup for running nfsen-ng (Netflow visualizer) and nfdump (Netflow/Sflow
 
 => additonnaly, you may add/remove lines in sources.conf... you need then to restart the stack by issuing 'docker-compose restart'
 
+## Tested with:
+- Arista EOS 4.23.3M (in Jan 2021)
+
 ## An issue ?
+
 1. clone
 2. correct
 3. share
