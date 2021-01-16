@@ -13,7 +13,7 @@ $nfsen_config = array(
             80, 22, 53, 443
         ),
         'sources' => array(
-            'router',
+            'router',  // DO NOT ALTER THIS LINE, it will be modified by entrypoint.sh
         ),
         'db' => 'RRD',
         'processor' => 'NfDump',
