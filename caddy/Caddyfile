@@ -1,0 +1,59 @@
+# Caddyfile for nfsen-ng-docker
+#
+# Default: self-signed TLS (tls internal) — works out of the box.
+# For a public domain with Let's Encrypt:
+#   1. set DOMAIN=nfsen.example.com in .env
+#   2. remove the "tls internal" line below
+#   3. docker compose up -d
+#
+# nfsen-ng 1.x serves the UI *and* its static assets itself (php-via on
+# OpenSwoole, port 9000) and Brotli-compresses them, so this proxy adds TLS,
+# basic auth, the access log and security headers — no compression, no static
+# file handling.
+
+{$DOMAIN:localhost} {
+	tls internal
+
+	# Access log (JSON), for the fail2ban recipe in README.md. Written to
+	# /data (= ./caddy-data on the host, already mounted and gitignored), so
+	# no extra volume is needed; Caddy rotates it by size. A site-level log
+	# directive keeps startup/error logs on stderr (docker compose logs) —
+	# the global "log" option would redirect those to the file as well.
+	log {
+		output file /data/access.log {
+			roll_size 10MB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+		format json
+	}
+
+	# basic auth — generate the hash once with:
+	#   docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
+	# and put the result into AUTH_PASS_HASH in .env
+	basic_auth {
+		{$AUTH_USER} {$AUTH_PASS_HASH}
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	# The UI pushes live updates over Server-Sent Events; -1 makes Caddy flush
+	# each chunk as it arrives instead of buffering the stream.
+	reverse_proxy nfsen:9000 {
+		flush_interval -1
+	}
+}
+
+# Plain HTTP → HTTPS. The target port is the one published on the host
+# (HTTPS_PORT, set through the compose environment), not the container's 443:
+# with non-privileged host ports (8080/8443 by default, needed on rootless
+# daemons) a redirect to :443 would go nowhere. ":443" is appended only when
+# it is the published port, where the explicit port is harmless.
+:80 {
+	redir https://{$DOMAIN:localhost}:{$HTTPS_PORT}{uri} permanent
+}
