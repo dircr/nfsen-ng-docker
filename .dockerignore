@@ -1,0 +1,9 @@
+profiles-data
+.git
+.env
+.pi
+caddy-data
+caddy-config
+logs
+*.md
+nfsen-state

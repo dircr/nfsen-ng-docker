@@ -1,21 +1,168 @@
-version: '2'
-
 services:
 
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      # Bind to loopback by default: the UI is not meant to be reachable from
+      # the LAN unless asked for. Set WEB_BIND_ADDR=0.0.0.0 (or a LAN address)
+      # in .env to expose it. See "Security" in README.md.
+      - "${WEB_BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8080}:80"
+      - "${WEB_BIND_ADDR:-127.0.0.1}:${HTTPS_PORT:-8443}:443"
+    volumes:
+      # a directory mount, like the other services: single-file bind mounts are
+      # unreliable on some daemons (colima/lima handed over an empty directory)
+      - ./caddy:/etc/caddy:ro
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    environment:
+      AUTH_USER: ${AUTH_USER:?AUTH_USER is required (see .env.example)}
+      AUTH_PASS_HASH: ${AUTH_PASS_HASH:?AUTH_PASS_HASH is required (see .env.example)}
+      DOMAIN: ${DOMAIN:-localhost}
+      # used by the Caddyfile's HTTP→HTTPS redirect: it has to name the port
+      # that is actually published on the host
+      HTTPS_PORT: ${HTTPS_PORT:-8443}
+      TZ: ${TZ:-UTC}
+    # access log (JSON) is written to /data/access.log inside this volume —
+    # see the log block in caddy/Caddyfile
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-5}"
+    restart: unless-stopped
+    init: true
+    depends_on:
+      nfsen:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE   # bind :80 and :443
+    # raise these if Caddy gets OOM-killed or throttled under many clients
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+
   nfsen:
-    build: nfsen-ng
-    ports:
-    - 81:80
+    build:
+      context: .
+      dockerfile: nfsen-ng/Dockerfile
+    depends_on:
+      # the import daemon watches profiles-data/live; start once the collectors
+      # run so those directories exist on the first scan
+      nfdump:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-UTC}
+      # the collectors write their capture files in TZ; nfsen-ng's Health page
+      # cross-checks the two and warns when they differ
+      NFCAPD_TZ: ${TZ:-UTC}
+      # capture tree inside this container (see the volumes below)
+      NFSEN_NFDUMP_PROFILES: /data/nfsen-ng
+      NFSEN_IMPORT_YEARS: ${NFSEN_IMPORT_YEARS:-3}
+      NFSEN_TOPN_RETENTION_DAYS: ${NFSEN_TOPN_RETENTION_DAYS:-31}
+      # service ports the UI offers in its per-port views
+      NFSEN_PORTS: ${NFSEN_PORTS:-80,443,22,53}
+      NFSEN_LOG_LEVEL: ${NFSEN_LOG_LEVEL:-info}
+      # NFSEN_SOURCES is derived from conf/sources.conf by the entrypoint
     volumes:
-    - ./profiles-data:/var/nfdump/profiles-data
-    - ./sources.conf:/tmp/sources.conf:ro
+      - ./profiles-data:/data/nfsen-ng
+      # a directory mount: a single-file bind mount is not reliable on
+      # every daemon (colima/lima can present the host file as a directory)
+      - ./conf:/etc/nfsen:ro
+      # RRD databases + SQLite store (preferences, saved filters, alert
+      # history, top-N data). Survives image upgrades — back this up.
+      - ./nfsen-state:/var/lib/nfsen-ng
+    # php-via serves the UI and its static assets itself; Caddy reaches it on
+    # the compose network only, so nothing is published to the host here.
+    expose:
+      - "9000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-5}"
     restart: unless-stopped
-    
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      # read nfcapd files owned by the collector's uid (1000)
+      - DAC_OVERRIDE
+    # no read_only: Swoole writes /tmp/swoole.log and the state volume
+    security_opt:
+      - no-new-privileges:true
+    # raise these if the import daemon cannot keep up with many sources
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 256
+    healthcheck:
+      # One process serves everything. Probe a static asset (favicon.svg, 657 B)
+      # over HTTP: a bare TCP connect would report a hung worker as healthy, and
+      # a page render would cost an nfdump run every 30s.
+      test: ["CMD-SHELL", "curl -fsS --max-time 4 -o /dev/null http://127.0.0.1:9000/favicon.svg"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
   nfdump:
-    build: nfdump
-    ports:
-    - 9000-9099:9000-9099/udp
+    build:
+      context: .
+      dockerfile: nfdump/Dockerfile
+    user: "1000:1000"
+    read_only: true
+    # scratch space (validated sources copy). The tmpfs mode is set
+    # explicitly to 1777 (the long-standing default): runc 1.3.3 briefly
+    # defaulted tmpfs to 0755 (fixed in runc 1.3.4 / Docker 29.1.2), which
+    # denied uid 1000 writes to /tmp. services.tmpfs has no mode field, so
+    # this uses the volumes long syntax.
     volumes:
-    - ./profiles-data:/data
-    - ./sources.conf:/tmp/sources.conf:ro
+      - ./profiles-data:/data
+      # a directory mount: a single-file bind mount is not reliable on
+      # every daemon (colima/lima can present the host file as a directory)
+      - ./conf:/etc/nfsen:ro
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          # decimal YAML ints pass straight to os.FileMode; the 0o prefix
+          # spells out the octal value
+          mode: 0o1777
+    ports:
+      # open by default: the routers have to reach the collectors. Narrow it
+      # to the LAN address in .env (see "Security" in README.md).
+      - "${FLOW_BIND_ADDR:-0.0.0.0}:${UDP_PORT_RANGE:-9000-9099}:9000-9099/udp"
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-5}"
+    environment:
+      TZ: ${TZ:-UTC}
+      FLOW_RETENTION_DAYS: ${FLOW_RETENTION_DAYS:-30}
     restart: unless-stopped
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # raise these if collectors are killed or throttled
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    # nfcapd needs a moment to flush the current file on SIGTERM
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "fcapd"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,7 @@
+profiles-data/
+caddy-data/
+caddy-config/
+nfsen-state/
+logs/
+.env
+.pi
