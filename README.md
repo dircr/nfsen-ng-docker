@@ -76,7 +76,7 @@ On the first start the import daemon walks `profiles-data/live/` and builds the 
 
 | Variable          | Default     | Description |
 |-------------------|-------------|-------------|
-| `TZ`              | `UTC`       | Timezone for all containers (also passed to nfsen-ng as `NFCAPD_TZ`) |
+| `TZ`              | `UTC`       | Timezone for all containers, for nfsen-ng as `NFCAPD_TZ`, **and for PHP's `date.timezone`** (the entrypoint passes it per process — PHP ignores `TZ`, and without this the UI renders UTC while nfcapd writes local time) |
 | `HTTP_PORT`       | `8080`      | Host port for HTTP (redirects to HTTPS) |
 | `HTTPS_PORT`      | `8443`      | Host port for HTTPS |
 | `WEB_BIND_ADDR`   | `127.0.0.1` | Host address the UI binds to. Loopback by default — set `0.0.0.0` or a LAN address to expose it (see [Security](#security)) |

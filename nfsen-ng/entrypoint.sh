@@ -82,4 +82,10 @@ for dir in "${NFSEN_RRD_PATH:-/var/lib/nfsen-ng/rrd}" "${NFSEN_STATE_DIR:-/var/l
 done
 
 echo "Starting nfsen-ng on port 9000"
-exec php "$APP"
+# PHP does not read TZ (that is libc); its date functions use the date.timezone
+# ini setting, and the base image pins that to UTC. With TZ=Europe/Warsaw the app
+# would render every timestamp in UTC while nfcapd names its files in local time —
+# a one or two hour shift in every graph, which the Health page reports as
+# "php.ini date.timezone='UTC' overrides TZ env var". Passing it per process keeps
+# both in sync and works with the read-only root filesystem (nothing to write).
+exec php -d "date.timezone=${TZ:-UTC}" "$APP"

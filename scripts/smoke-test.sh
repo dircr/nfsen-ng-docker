@@ -267,6 +267,17 @@ else
     record FAIL "app serves HTTP on :9000" "docker compose logs nfsen"
 fi
 
+# PHP does not read TZ; the entrypoint passes date.timezone per process. Without
+# that the UI renders every timestamp in UTC while nfcapd names its files in local
+# time — a one or two hour shift in every graph, with nothing visibly broken.
+TZ_VALUE="$(env_value TZ UTC)"
+php_args="$(docker compose exec -T nfsen sh -c 'ps -o args= -C php 2>/dev/null | head -1')"
+case "$php_args" in
+    *"date.timezone=${TZ_VALUE}"*) record PASS "PHP timezone matches TZ" "$TZ_VALUE" ;;
+    *) record FAIL "PHP timezone matches TZ" \
+           "php is not running with -d date.timezone=${TZ_VALUE} (got: ${php_args:-none})" ;;
+esac
+
 # ── 7. Caddy: TLS + basic auth + proxy ───────────────────────────────────────
 curl_code() { # curl_code [--user u:p] -> prints HTTP status, or the error reason
     local err code
