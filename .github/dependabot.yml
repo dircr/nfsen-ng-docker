@@ -1,0 +1,40 @@
+version: 2
+#
+# Base-image digests and `uses:` tags are the two things that go stale silently
+# here. Everything else in this stack is pinned by hand in the Dockerfiles:
+#
+#   ARG NFDUMP_VERSION / NFDUMP_SHA256        nfdump/Dockerfile, nfsen-ng/Dockerfile
+#   ARG NFSEN_NG_VERSION / NFSEN_NG_COMMIT    nfsen-ng/Dockerfile
+#   ARG PHP_EXTENSIONS_INSTALLER_VERSION      nfsen-ng/Dockerfile
+#
+# Dependabot does not understand those ARGs, so bumping them (version *and*
+# checksum/commit together) stays a deliberate, reviewed change — see the
+# "Upgrading" section of README.md.
+updates:
+  - package-ecosystem: docker
+    directory: "/"            # docker-compose.yaml (caddy image)
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: docker
+
+  - package-ecosystem: docker
+    directory: "/nfdump"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: docker
+
+  - package-ecosystem: docker
+    directory: "/nfsen-ng"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: docker
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
