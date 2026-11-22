@@ -55,6 +55,7 @@ env_value() { # env_value <key> <default>
 }
 
 HTTPS_PORT="$(env_value HTTPS_PORT 8443)"
+HTTP_PORT="$(env_value HTTP_PORT 8080)"
 WEB_BIND_ADDR="$(env_value WEB_BIND_ADDR 127.0.0.1)"
 AUTH_USER="$(env_value AUTH_USER admin)"
 DOMAIN="$(env_value DOMAIN localhost)"
@@ -65,6 +66,8 @@ CONNECT_ADDR="$WEB_BIND_ADDR"
 [ "$CONNECT_ADDR" = "0.0.0.0" ] && CONNECT_ADDR=127.0.0.1
 CADDY_URL="https://${DOMAIN}:${HTTPS_PORT}/"
 CURL_TLS_OPTS=(-k --resolve "${DOMAIN}:${HTTPS_PORT}:${CONNECT_ADDR}")
+CURL_HTTP_OPTS=(-k --resolve "${DOMAIN}:${HTTP_PORT}:${CONNECT_ADDR}")
+HTTP_URL="http://${DOMAIN}:${HTTP_PORT}/"
 
 container_id() { docker compose ps -q "$1" 2>/dev/null; }
 health_of() { # health_of <service> -> healthy|unhealthy|starting|none
@@ -104,6 +107,48 @@ else
     record FAIL ".env present" "cp .env.example .env and set AUTH_PASS_HASH"
 fi
 
+# Mode of .env: it holds the basic-auth hash, so it must not be group/world
+# readable. stat differs between BSD (macOS) and GNU, hence the probe.
+if [ -f .env ]; then
+    env_mode="$(stat -f '%Lp' .env 2>/dev/null || stat -c '%a' .env 2>/dev/null)"
+    if [ -n "$env_mode" ] && [ "$env_mode" != "600" ]; then
+        record FAIL ".env mode is 0600" "is $env_mode — run: chmod 600 .env"
+    else
+        record PASS ".env mode is 0600"
+    fi
+fi
+
+# A placeholder hash lets the stack look configured while the password is
+# public knowledge; Caddy rejects it only at start-up, with an error that
+# names neither the file nor the variable. Starting anyway would take the UI
+# down, so both of these abort the run instead of reporting and continuing.
+FATAL=0
+if grep -qE '^[[:space:]]*AUTH_PASS_HASH=[[:space:]]*(\$\$)?REPLACE_WITH_GENERATED_HASH' .env 2>/dev/null; then
+    FATAL=1
+    record FAIL "AUTH_PASS_HASH is set" "still the placeholder — see the hash-password step in README"
+else
+    record PASS "AUTH_PASS_HASH is set"
+fi
+
+# Compose gives the process environment precedence over .env, so an exported
+# AUTH_PASS_HASH silently wins over the file. Anything that sources .env
+# instead of parsing it expands the $$ escaping to a shell PID and the hash
+# arrives corrupted (Caddy then exits with "illegal base64 data").
+if [ -n "${AUTH_PASS_HASH:-}" ] && [ "${AUTH_PASS_HASH}" != "$(env_value AUTH_PASS_HASH '')" ]; then
+    FATAL=1
+    record FAIL "AUTH_PASS_HASH from .env is not shadowed" \
+        "the environment carries a different value — run: env -u AUTH_PASS_HASH ./scripts/smoke-test.sh"
+else
+    record PASS "AUTH_PASS_HASH from .env is not shadowed"
+fi
+
+if [ "$FATAL" = 1 ]; then
+    printf '\n'
+    printf '%s\n' "${RESULTS[@]}"
+    printf '\nNot starting the stack: a broken AUTH_PASS_HASH stops caddy and takes the UI down.\n'
+    exit 1
+fi
+
 if docker compose config -q >/dev/null 2>&1; then
     record PASS "docker-compose.yaml parses"
 else
@@ -141,6 +186,54 @@ for service in nfdump nfsen caddy; do
     fi
 done
 
+# ── 4b. guards for the failure modes that look like "it works" ──────────────
+#
+# A mangled hash reaches Caddy as a non-hash and the container exits; check what
+# the process actually got rather than trusting .env. `$2a` is bcrypt; `$2b`/
+# `$2y` are equivalent variants produced by other tools.
+hash_prefix="$(docker compose exec -T caddy printenv AUTH_PASS_HASH 2>/dev/null | cut -c1-3)"
+case "$hash_prefix" in
+    '$2a'|'$2b'|'$2y') record PASS "Caddy received an intact hash" ;;
+    *) record FAIL "Caddy received an intact hash" \
+           "got '${hash_prefix}…' — see Troubleshooting: illegal base64 data" ;;
+esac
+
+# The UI port must never be published: the app has no authentication of its own.
+if [ -n "$(docker compose port nfsen 9000 2>/dev/null)" ]; then
+    record FAIL "app port 9000 is not published" \
+        "remove the ports: entry for nfsen — Caddy is the only way in"
+else
+    record PASS "app port 9000 is not published"
+fi
+
+# A long-running container can keep a stale view of its bind mount, in which
+# case it serves a config that is no longer in the repo and `caddy reload`
+# cannot even read the file.
+if docker compose exec -T caddy test -f /etc/caddy/Caddyfile 2>/dev/null; then
+    record PASS "Caddyfile is visible inside caddy"
+else
+    record FAIL "Caddyfile is visible inside caddy" \
+        "stale mount — docker compose up -d --force-recreate caddy"
+fi
+
+# The redirect has to name the port that is actually published, otherwise
+# http://host:HTTP_PORT lands on HTTPS :443 where nothing listens.
+redirect_url="$(curl "${CURL_HTTP_OPTS[@]}" -s -o /dev/null -w '%{redirect_url}' --max-time 10 "$HTTP_URL" 2>/dev/null)"
+case "$redirect_url" in
+    *":${HTTPS_PORT}/"*) record PASS "HTTP redirects to the published HTTPS port" "$redirect_url" ;;
+    *) record FAIL "HTTP redirects to the published HTTPS port" \
+           "got '${redirect_url:-none}', expected port ${HTTPS_PORT}" ;;
+esac
+
+# HTTP/3 is disabled on purpose: the host publishes no UDP for it, so Caddy
+# must not advertise an h3 endpoint that cannot be reached.
+if curl "${CURL_TLS_OPTS[@]}" -s -D - -o /dev/null --max-time 10 "$CADDY_URL" 2>/dev/null | grep -qi '^alt-svc:'; then
+    record FAIL "no unreachable alt-svc advertisement" \
+        "Caddy advertises HTTP/3 on a port that is not published"
+else
+    record PASS "no unreachable alt-svc advertisement"
+fi
+
 # ── 5. one nfdump in the stack ───────────────────────────────────────────────
 collector_version="$(docker compose exec -T nfdump nfdump -V 2>/dev/null | head -1)"
 ui_version="$(docker compose exec -T nfsen nfdump -V 2>/dev/null | head -1)"
@@ -176,6 +269,26 @@ if [ -n "$PASSWORD" ]; then
     result="$(curl_code -u "${AUTH_USER}:${PASSWORD}")"
     if [ "$result" = "HTTP 200" ]; then
         record PASS "login through Caddy" "200 at $CADDY_URL"
+        # Headers are only reachable on a served response: the deferred `header`
+        # handler does not run for the 401 that basic_auth produces, so this is
+        # the one probe that can see them.
+        hdrs="$(curl "${CURL_TLS_OPTS[@]}" -u "${AUTH_USER}:${PASSWORD}" -s -D - -o /dev/null \
+            --max-time 10 "$CADDY_URL" 2>/dev/null)"
+        missing=""
+        for h in x-content-type-options x-frame-options referrer-policy \
+                 permissions-policy content-security-policy; do
+            printf '%s' "$hdrs" | grep -qi "^${h}:" || missing="$missing $h"
+        done
+        if [ -z "$missing" ]; then
+            record PASS "security headers present"
+        else
+            record FAIL "security headers present" "missing:$missing"
+        fi
+        if printf '%s' "$hdrs" | grep -qi '^server:'; then
+            record FAIL "Server header suppressed" "the -Server directive did not take effect"
+        else
+            record PASS "Server header suppressed"
+        fi
     else
         record FAIL "login through Caddy" "$result at $CADDY_URL"
     fi

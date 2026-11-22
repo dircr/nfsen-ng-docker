@@ -7,3 +7,7 @@ caddy-config
 logs
 *.md
 nfsen-state
+docs
+fail2ban
+firewall
+.github

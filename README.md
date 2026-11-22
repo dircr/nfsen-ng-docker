@@ -70,7 +70,7 @@ On the first start the import daemon walks `profiles-data/live/` and builds the 
    ./scripts/smoke-test.sh --down             # stop the stack afterwards
    ```
 
-   It checks, in order: `docker compose` usable, `.env` present, `docker-compose.yaml` parses, `conf/sources.conf` valid, the stack starts, `nfdump`/`nfsen`/`caddy` reach `healthy`, **both containers report the same `nfdump` version**, the app answers HTTP on `:9000`, and Caddy serves TLS and demands basic auth (`401` without credentials, `200` with `--password`). Exit code is non-zero if anything fails, and every failure names the command that explains it.
+   It checks, in order: `docker compose` usable, `.env` present, `.env` mode `0600`, the hash is not the placeholder and is not shadowed by an exported variable (both abort before starting anything, because a broken hash stops `caddy` and takes the UI down), `docker-compose.yaml` parses, `conf/sources.conf` valid, the stack starts, `nfdump`/`nfsen`/`caddy` reach `healthy`, **the hash reaches Caddy as a bcrypt hash**, the UI port `:9000` is not published, the `Caddyfile` is actually visible inside the container (a stale bind mount otherwise hides it), the HTTP redirect names the published HTTPS port, no unreachable `alt-svc` is advertised, **both containers report the same `nfdump` version**, the app answers HTTP on `:9000`, and Caddy serves TLS and demands basic auth (`401` without credentials, `200` with `--password` — plus, then, the security headers and the absent `Server` header). Exit code is non-zero if anything fails, and every failure names the command that explains it.
 
 ## Configuration (.env)
 
@@ -121,6 +121,41 @@ It survives `docker compose up -d --build`, so upgrading the UI does not re-impo
 - **Container stdout** (`docker compose logs`) — nfsen-ng logs to stdout (level: `NFSEN_LOG_LEVEL`), the collectors log each started collector; rotated by Docker's `json-file` driver: `LOG_MAX_SIZE` per file, `LOG_MAX_FILES` files per container.
 - **App log file** — Swoole writes `/tmp/swoole.log` inside the nfsen container; it is disposable, `docker compose logs` is the canonical place.
 
+### Alerting
+
+Logs nobody reads are not monitoring. `scripts/watch-alerts.sh` is a read-only
+checker for the failures that otherwise stay quiet until someone notices missing
+data — it starts nothing and changes nothing:
+
+```sh
+./scripts/watch-alerts.sh --dry-run     # show findings, send nothing
+./scripts/watch-alerts.sh               # send, but only when the finding changes
+ALERT_URL=https://ntfy.sh/your-topic ./scripts/watch-alerts.sh
+```
+
+What it checks: containers running/**healthy**, a capture file written in the last
+`FRESH_MIN` minutes (15) — a silent router or firewall change looks exactly like
+“nothing interesting happened” in the UI — free disk above `DISK_MIN_FREE` (10%,
+because a full disk truncates capture files), basic-auth failures above
+`AUTH_MAX_FAILURES` (20) within `AUTH_WINDOW_MIN` (10) minutes, and whether the
+running Caddy can even see the Caddyfile that is in the repo (a stale bind mount
+otherwise serves a config nobody is editing).
+
+`ALERT_URL` gets a plain-text `POST` (ntfy, a generic webhook, a Slack workflow
+URL — anything that accepts a body). Without it the script behaves like a plain
+checker: findings on stdout, exit code 1, so cron mails them. It only notifies when
+the finding *changes*, so a standing problem does not page every five minutes.
+
+Run it from cron (Linux):
+
+```cron
+*/5 * * * * cd /path/to/nfsen-ng-docker && ALERT_URL=https://ntfy.sh/topic ./scripts/watch-alerts.sh >/dev/null
+```
+
+or from launchd (macOS) with a plist whose `ProgramArguments` are `/bin/bash -lc`
+plus the same line. On macOS this is the **only** detector for failed logins: the
+fail2ban jail below bans via `iptables` and therefore needs a Linux host.
+
 ### Let's Encrypt (public domain)
 
 1. Point a DNS record at this host.
@@ -154,6 +189,25 @@ The capture tree is compatible: both versions expect `<profiles-data>/live/<sour
 Removed along with Apache: `nfsen-ng/httpd.conf`, `php-fpm.conf`, `php.ini`, `healthcheck.sh`, `settings.php`, the `logs/nfsen/` mount and `LOG_RETENTION_DAYS`. The host's `logs/` directory is no longer used — delete it (`rm -rf logs`) if you do not want the old Apache logs around.
 
 Because the app changed completely, the first start imports history into a **new** RRD/SQLite store — allow it to run (watch `docker compose logs -f nfsen`). Nothing is lost: the capture files are the source of truth.
+
+### Bumping a pinned dependency
+
+Base images are pinned by digest, and the nfdump archive by sha256; the nfsen-ng tag is asserted against a pinned commit. Nothing here floats:
+
+```sh
+# base image digest (pick the tag you want, then take its index digest)
+docker pull php:8.4-cli
+docker image inspect php:8.4-cli --format '{{index .RepoDigests 0}}'
+
+# nfdump archive (only when NFDUMP_VERSION changes)
+docker run --rm caddy:2-alpine sh -c \
+  'wget -qO /tmp/n.zip https://github.com/phaag/nfdump/archive/refs/tags/v1.7.10.zip && sha256sum /tmp/n.zip'
+
+# commit behind an nfsen-ng tag
+curl -s https://api.github.com/repos/mbolli/nfsen-ng/git/refs/tags/v1.0.0-beta.7 | grep -m1 '"sha"'
+```
+
+Change the value **and** its comment together, then `docker compose build`. The CI build is what catches a re-pointed tag or a changed checksum; `scripts/smoke-test.sh` is what catches a working build that no longer serves.
 
 ## Firewall
 
@@ -201,44 +255,81 @@ Docker inserts its own DNAT rules into `nat/PREROUTING`, so published ports are 
 
 What this setup does and does not protect:
 
-- **The collectors do not authenticate senders.** Anyone who can reach a collector's UDP port can inject flows (visible in the UI, and stored until `FLOW_RETENTION_DAYS`). Limit reachability with `FLOW_BIND_ADDR` and the `DOCKER-USER` rules above; prefer exporting over a management network.
+- **The collectors do not authenticate senders.** Anyone who can reach a collector's UDP port can inject flows (visible in the UI, and stored until `FLOW_RETENTION_DAYS`). Limit reachability with `FLOW_BIND_ADDR` and the `DOCKER-USER` rules above; prefer exporting over a management network. `firewall/nftables-nfsen.nft` is the nftables version of the same rule (it has to hook `forward`, not `input`, so it sees DNAT'd traffic).
+- **One shared credential for the dashboard — no roles, no MFA, no revocation.** The options (status quo, `forward_auth` + an IdP, network identity, an IP allowlist) are compared in [`docs/adr/0001-auth-and-collector-trust.md`](docs/adr/0001-auth-and-collector-trust.md), with the exact Caddyfile change for the cheap one. This is the largest remaining gap in the stack and it is a product decision, not a bug.
 - **Basic auth is the only access control for the UI.** The `.env` file holds the password hash: `chmod 600 .env`. Basic auth credentials are sent on every request — TLS is what keeps them off the wire.
 - **`tls internal`** (the default) presents a self-signed certificate: encrypted, but not vouched for by a CA. Browsers warn, and users learn to click through warnings. For anything long-lived, use a real certificate (`DOMAIN` + Let's Encrypt, see above).
-- Containers run with `no-new-privileges`, `cap_drop: ALL` (plus the minimum each one needs — Caddy `NET_BIND_SERVICE`, the UI `DAC_OVERRIDE` to read capture files owned by the collector's uid), read-only root filesystem for the collector, and CPU/RAM/PID limits.
-- **The UI process runs as root inside its container** (the upstream `php:8.4-cli` base has no `USER`), because OpenSwoole binds port 9000 and the import daemon spawns `nfdump`. It is contained by `no-new-privileges`, `cap_drop: ALL` with only `DAC_OVERRIDE`, a 1 GiB memory / 2 CPU / 256 PID budget, and no published ports — but it is not an unprivileged process, unlike the collector.
+- Containers run with `no-new-privileges`, `cap_drop: ALL` (only Caddy re-adds `NET_BIND_SERVICE`, to bind `:80`/`:443` inside its container), read-only root filesystem for the collector, and CPU/RAM/PID limits.
+- **The UI process runs as uid 1000** — the same user as the collector, which owns the capture files, so reading them needs no capability; `cap_drop: ALL` leaves it with none at all. Its view of `profiles-data` is mounted **read-only**: the UI reads capture files and never writes them (no `nfexpire`, no `unlink`/`rmdir` on that path — checked against the app source), so a compromised UI cannot tamper with or delete the flow records the analysis rests on. Upgrading an existing install on Linux: `chown -R 1000:1000 nfsen-state` once, otherwise the app cannot write its SQLite store and RRD files.
 - The UI's port 9000 is not published: only Caddy reaches it, over the compose network. `sources.conf` is validated by both entrypoints before use — a device name becomes a directory name and an nfsen-ng source name.
+- **The compose network has no egress** (`nfsen-net` is `internal: true`). Nothing here needs the internet at runtime, so a compromised UI has nowhere to send captured flow data. Published ports still work — the daemon DNATs them straight to the container. Features that call out (geolocation tiles, alert e-mail, an MCP dependency) need a second, non-internal network for the `nfsen` service.
+- **Response headers:** `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Cross-Origin-Opener-Policy`/`-Resource-Policy`, `Permissions-Policy`, `X-Robots-Tag`, an enforced `Content-Security-Policy` (`object-src 'none'; base-uri 'self'; form-action 'self'`), the full policy in report-only mode, and `Strict-Transport-Security` for real hostnames only (never `localhost`, where it would pin a self-signed certificate for a year). Caddy's `Server` header is stripped. Caveat: Caddy applies these from a deferred handler, so **`401` responses — the ones an unauthenticated attacker sees — carry none of them and still say `Server: Caddy`**; do not treat the headers as protection for rejected requests.
 - **Not enabled by default:** nfsen-ng's read-only MCP endpoint (`NFSEN_MCP_HTTP=true` exposes `/_mcp` on port 9000). Treat access to it as equivalent to access to the dashboard.
+
+### Content-Security-Policy
+
+The UI renders inline `<script type="module">` blocks and an importmap, so `'unsafe-inline'` for scripts cannot be avoided without changes upstream. What the full policy still buys once enforced: no third-party script origins, and no exfiltration to another host (`connect-src`/`img-src`/`form-action`) — which is what a stored-XSS payload against flow data would need.
+
+It ships as `Content-Security-Policy-Report-Only`, so nothing breaks and violations only appear in the browser console. To enforce it:
+
+1. open the UI, walk the pages you actually use (Overview, Flows, Alerts, Health, a filter drawer, a live graph) with DevTools open;
+2. look for `Refused to …` / `Content Security Policy` messages;
+3. when the console is clean, rename the header in `caddy/Caddyfile` from `Content-Security-Policy-Report-Only` to `Content-Security-Policy`, then `docker compose up -d --force-recreate caddy`.
+
+If you enable nfsen-ng's geolocation, map tiles come from another origin — add that origin to `img-src` before enforcing, or keep the policy report-only.
 
 ### fail2ban for the UI
 
-Caddy writes a JSON access log to `caddy-data/access.log`. Failed basic-auth attempts appear as `401`. Example filter (`/etc/fail2ban/filter.d/caddy-401.conf`) — note that `remote_ip` and `status` can appear in either order in the JSON object:
-
-```ini
-[Definition]
-failregex = ^\{"level":"info".*"remote_ip":"<HOST>"[^}]*"status":401
-            ^\{"level":"info".*"status":401[^}]*"remote_ip":"<HOST>"
-datepattern = ^\{"level":"info","ts":(?P<time>\d+\.?\d*)
-```
-
-Jail (`/etc/fail2ban/jail.d/caddy.local`). Ban in `DOCKER-USER`: traffic arrives through Docker's DNAT (it lands on the `docker-proxy`/container network), so a plain `iptables` ban in `INPUT` does not stop it:
-
-```ini
-[caddy-401]
-enabled  = true
-port     = http,https
-filter   = caddy-401
-logpath  = /path/to/nfsen-ng-docker/caddy-data/access.log
-maxretry = 5
-findtime = 10m
-bantime  = 1h
-action   = iptables-allports[chain=DOCKER-USER, protocol=all, name=caddy-401]
-```
-
-Verify before enabling — matches on 401, none on 200:
+Caddy writes a JSON access log to `caddy-data/access.log`. Failed basic-auth attempts appear as `401`. The filter and jail ship in this repo — copy them where fail2ban reads them, set `logpath`, done:
 
 ```sh
-fail2ban-regex /path/to/nfsen-ng-docker/caddy-data/access.log /etc/fail2ban/filter.d/caddy-401.conf
+sudo cp fail2ban/filter.d/caddy-401.conf /etc/fail2ban/filter.d/
+sudo cp fail2ban/jail.d/caddy.local     /etc/fail2ban/jail.d/
+# edit logpath in the jail: absolute path to this repo's caddy-data/access.log
 ```
+
+Two things about that filter are easy to get wrong, and both were verified against a real log here — an earlier version matched **0 of 97** recorded 401s:
+
+- `remote_ip` is inside `request`, `status` is top-level and comes after `request` closes, so `<HOST>…[^}]*…"status":401` can never match. `.*` is required.
+- fail2ban matches the `failregex` against the remainder of the line **after** the date match. With a `datepattern` anchored at the start of the JSON, an anchored `failregex` sees a line starting mid-object and matches nothing. The shipped filter therefore keeps `datepattern` and drops `^` from the regexes.
+
+The jail bans in `DOCKER-USER`, because traffic to published container ports arrives through Docker's DNAT — a plain `iptables` ban in `INPUT` never sees it (same reasoning as the firewall section above).
+
+#### How to test it
+
+Always run this before enabling the jail — it needs no running fail2ban, only its Python module:
+
+```sh
+fail2ban-regex caddy-data/access.log fail2ban/filter.d/caddy-401.conf
+```
+
+What a working filter looks like (`97` is this repo's sample log; yours will differ):
+
+```
+Failregex: 97 total
+|-  #) [# of hits] regular expression
+|   1) [97] "remote_ip":"<HOST>".*"status":401
+Date template hits: [1077] ^\{"level":"info","ts":(?P<time>\d+)
+Lines: 1089 lines, 0 ignored, 97 matched, 992 missed
+```
+
+`0 matched` means the regex, not fail2ban, is wrong — `--print-all-missed` shows the lines it skipped. Also check for false positives, which is the half that actually bites in production:
+
+```sh
+grep '"status":200' caddy-data/access.log > /tmp/only200.log
+fail2ban-regex /tmp/only200.log fail2ban/filter.d/caddy-401.conf   # must report 0 matched
+```
+
+On a host without fail2ban (macOS, Windows) run the same check in a throwaway container — no jail, no iptables, just the regex engine:
+
+```sh
+docker run --rm \
+  -v "$PWD/caddy-data:/logs:ro" \
+  -v "$PWD/fail2ban/filter.d:/filters:ro" \
+  alpine sh -c 'apk add --no-cache -q fail2ban && fail2ban-regex /logs/access.log /filters/caddy-401.conf'
+```
+
+Note for macOS/Windows hosts: that container test validates the **filter only**. The jail above bans with `iptables`, so it needs a Linux host (and root). On Docker Desktop/Kiri the ban would have to be a `pf` rule or a rate limit in front of Caddy instead — until then the filter is useful only as a detector.
 
 ## nfdump version
 
@@ -281,6 +372,21 @@ The validator prints the normalized list and exits non-zero with `sources.conf:<
 - **`Permission denied (os error 13)` when starting `caddy`** — the daemon is rootless and cannot publish a privileged host port. Keep `HTTP_PORT`/`HTTPS_PORT` above 1024 (the defaults `8080`/`8443` already do), or switch to a rootful daemon.
 - **`docker compose up` says "address already in use"** — `WEB_BIND_ADDR`/`HTTP_PORT`/`HTTPS_PORT` collide with something on the host (a local web server on `127.0.0.1:80` is common). Set `HTTP_PORT`/`HTTPS_PORT` in `.env`, or `WEB_BIND_ADDR` to another address.
 - **Reset the password** — regenerate the hash, update `AUTH_PASS_HASH` in `.env`, then `docker compose up -d caddy`
+- **`caddy` exits with `base64-decoding password: illegal base64 data at input byte N`** — the hash did not arrive intact; Caddy refuses to start (fail-closed, but the message names neither the file nor the variable). Two causes, both seen here:
+  1. the `$$` escaping was lost (compose interpolates `$` in `.env`, so a bcrypt hash must be written `$$2a$$14$$…`); or
+  2. **`AUTH_PASS_HASH` is already exported in your shell** — compose gives the environment precedence over `.env`, so a stale or mangled value in the shell wins silently. Anything that *sources* `.env` instead of parsing it expands `$$` to a PID, producing exactly this failure.
+
+  Check what actually reaches the container before guessing:
+  ```sh
+  docker compose config --format json | grep AUTH_PASS_HASH   # must start with $$2a$14$ (re-escaped for display)
+  printenv AUTH_PASS_HASH                                     # should print nothing
+  env -u AUTH_PASS_HASH docker compose up -d caddy            # start with the value from .env instead
+  ```
+- **A change to `Caddyfile` (or `conf/sources.conf`) has no effect, and `/etc/caddy` looks empty inside the container** — the bind mount of a long-running container can go stale when the host file is replaced (editors and `git checkout` write a new inode through rename). The container keeps serving the config it loaded at start, and `caddy reload` cannot even read the file. Recreate rather than reload, and check:
+  ```sh
+  docker compose exec caddy ls -l /etc/caddy        # empty output = stale mount
+  docker compose up -d --force-recreate caddy
+  ```
 
 ## Tested with
 

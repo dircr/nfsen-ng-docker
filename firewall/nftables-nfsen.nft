@@ -1,0 +1,42 @@
+#!/usr/sbin/nft -f
+#
+# Only the routers listed in `flow_sources` may send flows to the published
+# collector range. Load with:
+#
+#   sudo nft -f firewall/nftables-nfsen.nft
+#
+# and persist it with your distribution's mechanism (nftables.service,
+# /etc/nftables.conf, or a systemd unit that runs the command above).
+#
+# Why `forward` and not `input`: published container ports are DNAT'd, so the
+# packets are routed to the container instead of being delivered locally. Docker
+# has the same problem — that is why the README's iptables recipe uses the
+# DOCKER-USER chain instead of INPUT. nftables has no DOCKER-USER, so this chain
+# hooks `forward` at priority -150, i.e. before Docker's own chains (which run at
+# -100), and therefore sees the traffic first.
+#
+# Edit the element set below. IPv6 exporters need a v6 set in an `inet` table —
+# add addresses there rather than switching the table to `ip`.
+
+table inet nfsen_collectors {
+	set flow_sources {
+		type ipv4_addr
+		flags interval
+		elements = {
+			192.168.10.1,		# edge-router (nflow 9000)
+			192.168.10.2		# core-switch (sflow 9001)
+			# 10.20.0.0/24,	# or a whole management range
+		}
+	}
+
+	chain forward {
+		type filter hook forward priority -150; policy accept;
+
+		# Flows are only accepted from the exporters above...
+		udp dport 9000-9099 ip saddr @flow_sources accept
+
+		# ...everything else aimed at the collector range is dropped. Keep this
+		# after the accept rule: the first matching rule wins.
+		udp dport 9000-9099 drop
+	}
+}
