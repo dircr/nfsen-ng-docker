@@ -40,7 +40,13 @@ services:
       nfsen:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      # Probes the :80 listener, which answers 301 to the published HTTPS port.
+      # The admin API is off (see caddy/Caddyfile), and probing the TLS site is
+      # not an option: this image's busybox wget has no way to skip certificate
+      # verification, so an https:// probe fails on the self-signed cert instead
+      # of reporting the real state. A 301 proves the process is alive *and*
+      # that the Caddyfile is loaded.
+      test: ["CMD-SHELL", "wget -qS -O /dev/null http://127.0.0.1:80/ 2>&1 | grep -q '301'"]
       interval: 30s
       timeout: 5s
       retries: 3
