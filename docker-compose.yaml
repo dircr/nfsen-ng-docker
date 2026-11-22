@@ -198,17 +198,17 @@ services:
       - nfsen-net
 
 networks:
-  # No egress: nothing here needs the internet at runtime — images, nfdump and
-  # the PHP extensions are built beforehand — so a compromised UI has nowhere to
-  # send captured flow data. Published ports keep working: the daemon DNATs them
-  # straight to the container instead of routing through the network gateway
-  # (verified: HTTP 200 through a published port, outbound wget blocked).
+  # A named network, so the stack stays isolated from other compose projects on
+  # the same daemon.
   #
-  # A named network is used rather than `default: {internal: true}` because some
-  # engines (Kiri) refuse to flip the auto-created default network on recreate.
+  # NOT `internal: true`, deliberately. An internal network has no gateway, and
+  # Docker (29.x on Linux) then publishes *no* ports for the containers on it:
+  # HostConfig.PortBindings still carries the mapping, but NetworkSettings.Ports
+  # comes back null for every port, no DNAT rule and no docker-proxy are created,
+  # and the outside world gets "connection refused" while every container reports
+  # healthy. Learned the hard way on a real daemon — a VM-based engine publishes
+  # anyway, which is how it slipped through the smoke test here.
   #
-  # If you enable features that call out (geolocation tiles, alert e-mail/SMTP,
-  # an MCP dependency), attach `nfsen` to a second, non-internal network instead
-  # of removing this one.
-  nfsen-net:
-    internal: true
+  # Block egress at the firewall instead (Docker's DOCKER-USER chain, or
+  # firewall/nftables-nfsen.nft) if that is what you want.
+  nfsen-net: {}
