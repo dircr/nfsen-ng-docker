@@ -64,14 +64,32 @@ else
     done
 fi
 
-# ── 2. the collector is still writing files ──────────────────────────────────
-# nfcapd rotates every 5 minutes, so a 15 minute silence means no flows arrive
-# (router down, firewall change, wrong port) — the UI shows nothing new and no
-# error anywhere.
+# ── 2. the collector is still writing flows ──────────────────────────────────
+# Two separate failures look identical in the UI: no file at all, and a file that
+# was rotated on schedule but never received a packet. nfcapd writes a fresh file
+# every 5 minutes regardless, so freshness alone proves nothing — an empty
+# capture is ~212 bytes of header. Check both.
 profiles_dir="${NFSEN_NFDUMP_PROFILES_DIR:-profiles-data/live}"
+EMPTY_CAPTURE_BYTES="${EMPTY_CAPTURE_BYTES:-512}"
 if [ -d "$profiles_dir" ]; then
-    if ! find "$profiles_dir" -type f -name 'nfcapd.*' -mmin "-$FRESH_MIN" 2>/dev/null | head -1 | grep -q .; then
-        problem "no capture file written in the last ${FRESH_MIN} min under $profiles_dir"
+    newest="$(find "$profiles_dir" -type f -name 'nfcapd.*' ! -name 'nfcapd.current.*' \
+        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+    if [ -z "$newest" ]; then
+        newest="$(ls -t "$profiles_dir"/*/*/*/*/nfcapd.* 2>/dev/null | head -1)"
+    fi
+
+    if [ -z "$newest" ]; then
+        problem "no completed capture file under $profiles_dir"
+    else
+        if find "$newest" -mmin "-$FRESH_MIN" 2>/dev/null | grep -q .; then
+            :
+        else
+            problem "no capture file written in the last ${FRESH_MIN} min under $profiles_dir"
+        fi
+        size="$(wc -c < "$newest" 2>/dev/null | tr -d ' ')"
+        if [ -n "$size" ] && [ "$size" -lt "$EMPTY_CAPTURE_BYTES" ]; then
+            problem "collector writes empty capture files (${size} B) — files rotate but no flows arrive: check the exporters and the firewall for UDP 9000-9099"
+        fi
     fi
 else
     problem "$profiles_dir does not exist"
@@ -84,10 +102,23 @@ if [ -n "$free_pct" ] && [ "$free_pct" -lt "$DISK_MIN_FREE" ]; then
 fi
 
 # ── 4. basic-auth failures in the recent log tail ───────────────────────────
+# The log is written by Caddy inside the container, which runs as root, so on a
+# normal installation the host copy is root-owned and unreadable for the
+# operator — a stale permission must not look like a missing log. Read it
+# through the container when the host path is not readable.
 log_path="caddy-data/access.log"
 if [ -r "$log_path" ]; then
+    log_tail="$(tail -n 5000 "$log_path" 2>/dev/null)"
+    log_ok=1
+elif log_tail="$(docker compose exec -T caddy tail -n 5000 /data/access.log 2>/dev/null)"; then
+    log_ok=1
+else
+    log_ok=0
+fi
+
+if [ "$log_ok" = 1 ]; then
     since="$(( $(date +%s) - AUTH_WINDOW_MIN * 60 ))"
-    failures="$(tail -n 5000 "$log_path" 2>/dev/null | awk -v since="$since" '
+    failures="$(printf '%s\n' "$log_tail" | awk -v since="$since" '
         {
             if (match($0, /"ts":[0-9.]+/)) {
                 ts = substr($0, RSTART + 5, RLENGTH - 5) + 0;
@@ -100,7 +131,7 @@ if [ -r "$log_path" ]; then
         problem "${failures} failed logins in ${AUTH_WINDOW_MIN} min (threshold ${AUTH_MAX_FAILURES}) — see the fail2ban filter in README.md"
     fi
 else
-    problem "$log_path is not readable — access log missing or permissions changed"
+    problem "cannot read $log_path, neither on the host nor inside the caddy container"
 fi
 
 # ── 5. the container sees the Caddyfile that is in the repo ─────────────────
