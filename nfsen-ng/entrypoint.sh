@@ -75,6 +75,8 @@ fi
 for dir in "${NFSEN_RRD_PATH:-/var/lib/nfsen-ng/rrd}" "${NFSEN_STATE_DIR:-/var/lib/nfsen-ng/state}"; do
     if ! mkdir -p "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
         echo >&2 "Error: $dir is not writable as uid $(id -u) — is ./nfsen-state mounted there?"
+        echo >&2 "  fix the ownership once (the container runs as the collector's uid):"
+        echo >&2 "  docker run --rm -v \"\$PWD/nfsen-state:/s\" alpine chown -R 1000:1000 /s"
         exit 1
     fi
 done
