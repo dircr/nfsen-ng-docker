@@ -174,6 +174,28 @@ Ports are configured in `.env` — no need to edit `docker-compose.yaml`. `HTTPS
 
 The defaults are `8080`/`8443` rather than `80`/`443` because ports below 1024 can only be published by a **rootful** daemon (Docker Desktop, colima). With a rootless runtime (e.g. kiri) `docker compose up` fails with `Engine ports not published; ... Permission denied (os error 13)`. On a rootful daemon you can switch back to `80`/`443` in `.env`.
 
+### Reaching the UI from other machines (LAN)
+
+Three values change together. Changing only the first is the usual way to end up with a certificate warning and then a connection that fails outright:
+
+| Variable | Value | Why |
+|---|---|---|
+| `WEB_BIND_ADDR` | `10.0.0.171` | otherwise Docker publishes the port on loopback only |
+| `DOMAIN` | `10.0.0.171` | Caddy issues the certificate for *this* name; browsing an address while `DOMAIN=localhost` is a name mismatch |
+| `CADDY_DEFAULT_SNI` | `10.0.0.171` | **only for a bare IP**: browsers send no SNI for IP literals, so Caddy cannot pick a certificate and the handshake dies with `tlsv1 alert internal error` |
+
+```sh
+docker compose up -d --force-recreate caddy
+```
+
+**Better: use a name instead of the IP.** `DOMAIN=nfsen.lan` with a DNS record (or an `/etc/hosts` line on the clients) pointing at `10.0.0.171` needs no SNI workaround, matches the certificate without warnings once the root CA is trusted, and lets HSTS do something — browsers ignore HSTS for IP literals, so on a bare IP that header is silently dropped.
+
+Trusting the certificate (`tls internal`): copy `caddy-data/caddy/pki/authorities/local/root.crt` to the clients — on Linux into `/usr/local/share/ca-certificates/` followed by `update-ca-certificates`, on macOS into Keychain Access with "Always trust". Trust the **root**: the leaf is valid for 12 hours and rotates (see `openssl x509 -noout -dates` against the site), so pinning the leaf is a trap.
+
+`./scripts/smoke-test.sh` checks the combination above: with `DOMAIN` set to an IPv4 literal and no matching `CADDY_DEFAULT_SNI`, it fails with that hint instead of a TLS error.
+
+Remember that the UI is now visible to the whole LAN, and one shared password is its only protection — see [`docs/adr/0001-auth-and-collector-trust.md`](docs/adr/0001-auth-and-collector-trust.md) for the allowlist snippet and the alternatives.
+
 ## Upgrading from the v0.4 setup
 
 This repository used to build nfsen-ng **v0.4.0** on Apache + php-fpm. It now runs **1.0.0-beta.7**, where the whole UI — pages, static assets, SSE, import daemon — is one OpenSwoole process on port 9000. What that means in practice:

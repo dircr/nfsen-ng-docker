@@ -20,6 +20,9 @@ services:
       AUTH_USER: ${AUTH_USER:?AUTH_USER is required (see .env.example)}
       AUTH_PASS_HASH: ${AUTH_PASS_HASH:?AUTH_PASS_HASH is required (see .env.example)}
       DOMAIN: ${DOMAIN:-localhost}
+      # certificate to serve when the client sends no SNI — only needed when
+      # DOMAIN is a bare IP (browsers send no SNI for IP literals)
+      CADDY_DEFAULT_SNI: ${CADDY_DEFAULT_SNI:-localhost}
       # used by the Caddyfile's HTTP→HTTPS redirect: it has to name the port
       # that is actually published on the host
       HTTPS_PORT: ${HTTPS_PORT:-8443}

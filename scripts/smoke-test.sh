@@ -149,6 +149,22 @@ if [ "$FATAL" = 1 ]; then
     exit 1
 fi
 
+# DOMAIN as a bare IP: browsers send no SNI for IP literals, so Caddy needs to be
+# told which certificate to fall back to. Without that the handshake dies with
+# "tlsv1 alert internal error" and every HTTPS check below reports a meaningless
+# 000, which reads like a broken stack instead of a missing setting.
+case "$DOMAIN" in
+    *[A-Za-z]*|'') ;;   # a hostname (or unset): SNI is always sent, nothing to check
+    *)
+        if [ "$(env_value CADDY_DEFAULT_SNI localhost)" != "$DOMAIN" ]; then
+            record FAIL "CADDY_DEFAULT_SNI matches the IP DOMAIN" \
+                "DOMAIN=$DOMAIN is an IP literal — set CADDY_DEFAULT_SNI=$DOMAIN in .env, otherwise HTTPS cannot complete a handshake"
+        else
+            record PASS "CADDY_DEFAULT_SNI matches the IP DOMAIN"
+        fi
+        ;;
+esac
+
 if docker compose config -q >/dev/null 2>&1; then
     record PASS "docker-compose.yaml parses"
 else

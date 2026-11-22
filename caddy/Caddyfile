@@ -21,6 +21,13 @@
 	# automation is unaffected).
 	auto_https disable_redirects
 
+	# Certificate to present when the client sends no SNI. Browsers do not send
+	# SNI for a bare IP address, so with `DOMAIN` set to an IP (LAN deployment
+	# without DNS) Caddy cannot pick a certificate and the handshake fails with
+	# "tlsv1 alert internal error". Set CADDY_DEFAULT_SNI to that IP in .env.
+	# Harmless otherwise: with a hostname, SNI is always present.
+	default_sni {$CADDY_DEFAULT_SNI:localhost}
+
 	# HTTP/3 off: Caddy advertises ``alt-svc: h3=":443"`` using its *listener*
 	# port, but the host publishes 8443/tcp only — no UDP at all. Browsers would
 	# try QUIC on a port that is both unpublished and closed, then fall back.
