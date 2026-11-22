@@ -12,13 +12,21 @@
 # the wrapper that turns conf/sources.conf into NFSEN_SOURCES (last stage).
 
 # ── application sources + composer vendor ─────────────────────────────────────
-FROM composer:2 AS vendor
+# Base image pinned by digest (see nfdump/Dockerfile for the reasoning). The
+# composer image only supplies the vendor/ directory; its PHP version is
+# irrelevant.
+FROM composer:2@sha256:50ea4d33fdcde1adb0f045547295faa1548b33872e5f789dae5b02ce2fb5de93 AS vendor
 
 ARG NFSEN_NG_VERSION=v1.0.0-beta.7
+# Commit behind that tag. The tag can be re-pointed (and a `git clone --branch`
+# would silently follow it); the commit cannot. The clone still uses the tag so
+# the checkout is shallow, and the assertion below is what makes it safe.
+ARG NFSEN_NG_COMMIT=903d226a8c97cf4bc007d161fe77d7a5dff2a1b9
 
 WORKDIR /app
 RUN set -eux; \
     git clone --depth 1 --branch "${NFSEN_NG_VERSION}" https://github.com/mbolli/nfsen-ng.git .; \
+    test "$(git rev-parse HEAD)" = "${NFSEN_NG_COMMIT}"; \
     rm -rf .git
 
 # --ignore-platform-reqs: the PHP extensions (openswoole, inotify, rrd,
@@ -35,9 +43,11 @@ RUN rm -rf tests book .github .php-cs-fixer.php .rector.php phpstan.neon phpunit
 # ── nfdump, compiled once and shared with the collector ───────────────────────
 # Same version as nfdump/Dockerfile: the UI reads the files the collector writes,
 # and nfdump's file format is only stable within a minor series.
-FROM debian:13-slim AS nfdump
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS nfdump
 
 ARG NFDUMP_VERSION=1.7.10
+# Same archive, same checksum as nfdump/Dockerfile: one nfdump version, verified.
+ARG NFDUMP_SHA256=cc529734017cb740e499f564a17ff46d3fbc2e8392464a54b3e6ff403cfa43cf
 
 # hadolint ignore=DL3008
 RUN set -eux; \
@@ -51,6 +61,8 @@ WORKDIR /tmp
 RUN set -eux; \
     curl -fsSL -o nfdump.zip \
         "https://github.com/phaag/nfdump/archive/refs/tags/v${NFDUMP_VERSION}.zip"; \
+    echo "${NFDUMP_SHA256}  nfdump.zip" > nfdump.sha256; \
+    sha256sum -c nfdump.sha256; \
     unzip -q nfdump.zip; \
     rm -f nfdump.zip
 
@@ -62,7 +74,7 @@ RUN set -eux; \
     make install
 
 # ── runtime ──────────────────────────────────────────────────────────────────
-FROM php:8.4-cli
+FROM php:8.4-cli@sha256:6b13a8678b38ca38e4e3950be57b664ed8c8706131a0586111f68792aede4c58
 
 LABEL org.opencontainers.image.title="nfsen-ng" \
       org.opencontainers.image.description="nfsen-ng UI on php-via/OpenSwoole with nfdump" \

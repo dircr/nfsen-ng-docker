@@ -1,7 +1,9 @@
 services:
 
   caddy:
-    image: caddy:2-alpine
+    # Pinned by digest: tags move, digests do not. Bump together with caddy's
+    # Caddyfile compatibility — see "Upgrading" in README.md.
+    image: caddy:2-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
     ports:
       # Bind to loopback by default: the UI is not meant to be reachable from
       # the LAN unless asked for. Set WEB_BIND_ADDR=0.0.0.0 (or a LAN address)
@@ -48,8 +50,10 @@ services:
       - NET_BIND_SERVICE   # bind :80 and :443
     # raise these if Caddy gets OOM-killed or throttled under many clients
     mem_limit: 256m
-    cpus: 1.0
+    cpus: ${CADDY_CPUS:-1.0}
     pids_limit: 128
+    networks:
+      - nfsen-net
 
   nfsen:
     build:
@@ -74,7 +78,11 @@ services:
       NFSEN_LOG_LEVEL: ${NFSEN_LOG_LEVEL:-info}
       # NFSEN_SOURCES is derived from conf/sources.conf by the entrypoint
     volumes:
-      - ./profiles-data:/data/nfsen-ng
+      # Read-only on purpose: the UI reads capture files and never writes them
+      # (no nfexpire call, no unlink/rmdir/mkdir on this path — checked against
+      # the app source). With write access a compromised UI could tamper with
+      # or delete the flow records the analysis is based on.
+      - ./profiles-data:/data/nfsen-ng:ro
       # a directory mount: a single-file bind mount is not reliable on
       # every daemon (colima/lima can present the host file as a directory)
       - ./conf:/etc/nfsen:ro
@@ -92,17 +100,26 @@ services:
         max-file: "${LOG_MAX_FILES:-5}"
     restart: unless-stopped
     init: true
+    # Same uid as the collector: it owns the capture files (0644/0755) and the
+    # nfsen-state volume, so reading them needs no capability at all. Running
+    # this container as root only papered over file ownership — port 9000 is
+    # unprivileged and spawning nfdump does not require root either. Upgrading
+    # an existing install on Linux: chown -R 1000:1000 nfsen-state once.
+    user: "1000:1000"
     cap_drop:
       - ALL
-    cap_add:
-      # read nfcapd files owned by the collector's uid (1000)
-      - DAC_OVERRIDE
-    # no read_only: Swoole writes /tmp/swoole.log and the state volume
+    # Root filesystem read-only: everything the app writes lives on the two
+    # volumes (state) or in /tmp (Swoole's log). Writes into the image itself
+    # were checked against the app source — none. tmpfs mode 1777 because
+    # tmpfs defaults to 0755 on some runc versions, which would deny uid 1000.
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
     security_opt:
       - no-new-privileges:true
     # raise these if the import daemon cannot keep up with many sources
     mem_limit: 1g
-    cpus: 2.0
+    cpus: ${NFSEN_CPUS:-2.0}
     pids_limit: 256
     healthcheck:
       # One process serves everything. Probe a static asset (favicon.svg, 657 B)
@@ -113,6 +130,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+    networks:
+      - nfsen-net
 
   nfdump:
     build:
@@ -156,7 +175,7 @@ services:
       - no-new-privileges:true
     # raise these if collectors are killed or throttled
     mem_limit: 512m
-    cpus: 1.0
+    cpus: ${NFDUMP_CPUS:-1.0}
     pids_limit: 128
     # nfcapd needs a moment to flush the current file on SIGTERM
     stop_grace_period: 30s
@@ -166,3 +185,21 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      - nfsen-net
+
+networks:
+  # No egress: nothing here needs the internet at runtime — images, nfdump and
+  # the PHP extensions are built beforehand — so a compromised UI has nowhere to
+  # send captured flow data. Published ports keep working: the daemon DNATs them
+  # straight to the container instead of routing through the network gateway
+  # (verified: HTTP 200 through a published port, outbound wget blocked).
+  #
+  # A named network is used rather than `default: {internal: true}` because some
+  # engines (Kiri) refuse to flip the auto-created default network on recreate.
+  #
+  # If you enable features that call out (geolocation tiles, alert e-mail/SMTP,
+  # an MCP dependency), attach `nfsen` to a second, non-internal network instead
+  # of removing this one.
+  nfsen-net:
+    internal: true

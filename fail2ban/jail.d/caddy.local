@@ -1,0 +1,13 @@
+[caddy-401]
+enabled  = true
+port     = http,https
+filter   = caddy-401
+# Absolute path on the host that runs fail2ban — this file lives outside the
+# repo on purpose, because the path is host-specific.
+logpath  = /path/to/nfsen-ng-docker/caddy-data/access.log
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+# Bans must land in DOCKER-USER, not INPUT: published container ports are
+# reached through Docker's DNAT, so a ban in INPUT never sees the traffic.
+action   = iptables-allports[chain=DOCKER-USER, protocol=all, name=caddy-401]

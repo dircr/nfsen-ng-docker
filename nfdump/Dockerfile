@@ -4,9 +4,18 @@
 # (the image the UI now runs) warns below 1.7.10 on its Health page. Building
 # the same version in both images also removes the version-parity question
 # entirely: there is exactly one nfdump in the stack.
-FROM debian:13-slim AS build
+#
+# Base images are pinned by digest so two builds of the same commit produce the
+# same bytes and an account compromise at the registry cannot swap the image
+# under an unchanged tag. Bump a digest together with its comment.
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS build
 
 ARG NFDUMP_VERSION=1.7.10
+# sha256 of the tag archive, verified before unpacking: the tag is mutable, the
+# hash is not. GitHub's generated archives are not promised to be byte-stable
+# forever — if this ever fails, re-check the hash against a fresh clone of the
+# tag (git archive) instead of deleting the check.
+ARG NFDUMP_SHA256=cc529734017cb740e499f564a17ff46d3fbc2e8392464a54b3e6ff403cfa43cf
 
 # hadolint ignore=DL3008
 RUN set -eux; \
@@ -20,6 +29,8 @@ WORKDIR /tmp
 RUN set -eux; \
     curl -fsSL -o nfdump.zip \
         "https://github.com/phaag/nfdump/archive/refs/tags/v${NFDUMP_VERSION}.zip"; \
+    echo "${NFDUMP_SHA256}  nfdump.zip" > nfdump.sha256; \
+    sha256sum -c nfdump.sha256; \
     unzip -q nfdump.zip; \
     rm -f nfdump.zip
 
@@ -30,8 +41,7 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install
 
-FROM debian:13-slim
-
+FROM debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 LABEL org.opencontainers.image.title="nfdump collector" \
       org.opencontainers.image.description="NetFlow/sFlow collector (nfcapd/sfcapd)" \
       org.opencontainers.image.source="https://github.com/dircr/nfsen-ng-docker" \

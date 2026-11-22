@@ -11,6 +11,27 @@
 # basic auth, the access log and security headers — no compression, no static
 # file handling.
 
+# Global options — first block in the file.
+{
+	# Caddy answers HTTP requests for the site's own hostname with a built-in 308
+	# to https://<host>/, i.e. port 443. This stack publishes HTTPS_PORT (8443
+	# by default), so that redirect lands on a port where nothing listens. The
+	# :80 site below does the same job but knows the published port; disabling
+	# the built-in one makes that block the only redirect (certificate
+	# automation is unaffected).
+	auto_https disable_redirects
+
+	# HTTP/3 off: Caddy advertises ``alt-svc: h3=":443"`` using its *listener*
+	# port, but the host publishes 8443/tcp only — no UDP at all. Browsers would
+	# try QUIC on a port that is both unpublished and closed, then fall back.
+	# Rather than advertise something that cannot work (or add a UDP mapping
+	# just to satisfy the header), serve HTTP/1.1 + HTTP/2 only. To get HTTP/3
+	# back: publish 8443/udp and set HTTPS_PORT=443, then drop this block.
+	servers {
+		protocols h1 h2
+	}
+}
+
 {$DOMAIN:localhost} {
 	tls internal
 
@@ -40,7 +61,30 @@
 		X-Content-Type-Options nosniff
 		X-Frame-Options DENY
 		Referrer-Policy strict-origin-when-cross-origin
+		Cross-Origin-Opener-Policy same-origin
+		Cross-Origin-Resource-Policy same-origin
+		X-Robots-Tag "noindex, nofollow"
+		Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=(), usb=(), serial=(), interest-cohort=()"
+
+		# Enforced, and cannot break this app: the UI loads no plugins, has no
+		# <base>, and posts no forms to other origins. Small but free.
+		Content-Security-Policy "object-src 'none'; base-uri 'self'; form-action 'self'"
+
+		# Full policy, report-only until the browser console is clean (README
+		# "Content-Security-Policy" has the flip procedure). The UI renders
+		# inline <script type="module"> blocks and an importmap, so
+		# 'unsafe-inline' for scripts is unavoidable without app changes — what
+		# this still buys once enforced: no third-party script origins, no
+		# exfiltration to any other host (connect-src/img-src/form-action), no
+		# <object>, no <base> hijack.
+		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
 	}
+
+	# HSTS only for a real hostname: on localhost it protects nothing and would
+	# pin a self-signed certificate for a year. includeSubDomains/preload are
+	# omitted on purpose — neither is undoable in practice.
+	@realhost not host localhost 127.0.0.1 [::1]
+	header @realhost Strict-Transport-Security "max-age=31536000"
 
 	# The UI pushes live updates over Server-Sent Events; -1 makes Caddy flush
 	# each chunk as it arrives instead of buffering the stream.
