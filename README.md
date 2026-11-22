@@ -92,6 +92,9 @@ On the first start the import daemon walks `profiles-data/live/` and builds the 
 | `NFSEN_LOG_LEVEL` | `info`      | `DEBUG`, `INFO`, `NOTICE`, `WARNING`, `ERR`, `CRIT`, `ALERT`, `EMERG` |
 | `LOG_MAX_SIZE`    | `10m`       | Container stdout: max size per log file (docker `json-file` driver) |
 | `LOG_MAX_FILES`   | `5`         | Container stdout: number of log files kept per container |
+| `CADDY_CPUS`      | `1.0`       | CPU budget for the proxy in cores; fractions allowed. Every rejected request costs one bcrypt verification, so this bounds how hard a password-guessing flood can bite |
+| `NFSEN_CPUS`      | `2.0`       | CPU budget for the UI/import process in cores. Raise it when the import falls behind on many sources |
+| `NFDUMP_CPUS`     | `1.0`       | CPU budget for the collectors in cores |
 
 Any other [nfsen-ng environment variable](https://mbolli.github.io/nfsen-ng/deployment/configuration.html) can be added to the `nfsen` service's `environment:` block in `docker-compose.yaml` (geolocation, MCP endpoint, VictoriaMetrics, alert e-mail, …).
 
