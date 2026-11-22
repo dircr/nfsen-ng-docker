@@ -5,3 +5,4 @@ nfsen-state/
 logs/
 .env
 .pi
+scripts/runtime-audit.sh
