@@ -20,6 +20,9 @@ services:
       AUTH_USER: ${AUTH_USER:?AUTH_USER is required (see .env.example)}
       AUTH_PASS_HASH: ${AUTH_PASS_HASH:?AUTH_PASS_HASH is required (see .env.example)}
       DOMAIN: ${DOMAIN:-localhost}
+      # certificate to serve when the client sends no SNI — only needed when
+      # DOMAIN is a bare IP (browsers send no SNI for IP literals)
+      CADDY_DEFAULT_SNI: ${CADDY_DEFAULT_SNI:-localhost}
       # used by the Caddyfile's HTTP→HTTPS redirect: it has to name the port
       # that is actually published on the host
       HTTPS_PORT: ${HTTPS_PORT:-8443}
@@ -37,7 +40,13 @@ services:
       nfsen:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      # Probes the :80 listener, which answers 301 to the published HTTPS port.
+      # The admin API is off (see caddy/Caddyfile), and probing the TLS site is
+      # not an option: this image's busybox wget has no way to skip certificate
+      # verification, so an https:// probe fails on the self-signed cert instead
+      # of reporting the real state. A 301 proves the process is alive *and*
+      # that the Caddyfile is loaded.
+      test: ["CMD-SHELL", "wget -qS -O /dev/null http://127.0.0.1:80/ 2>&1 | grep -q '301'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -189,17 +198,17 @@ services:
       - nfsen-net
 
 networks:
-  # No egress: nothing here needs the internet at runtime — images, nfdump and
-  # the PHP extensions are built beforehand — so a compromised UI has nowhere to
-  # send captured flow data. Published ports keep working: the daemon DNATs them
-  # straight to the container instead of routing through the network gateway
-  # (verified: HTTP 200 through a published port, outbound wget blocked).
+  # A named network, so the stack stays isolated from other compose projects on
+  # the same daemon.
   #
-  # A named network is used rather than `default: {internal: true}` because some
-  # engines (Kiri) refuse to flip the auto-created default network on recreate.
+  # NOT `internal: true`, deliberately. An internal network has no gateway, and
+  # Docker (29.x on Linux) then publishes *no* ports for the containers on it:
+  # HostConfig.PortBindings still carries the mapping, but NetworkSettings.Ports
+  # comes back null for every port, no DNAT rule and no docker-proxy are created,
+  # and the outside world gets "connection refused" while every container reports
+  # healthy. Learned the hard way on a real daemon — a VM-based engine publishes
+  # anyway, which is how it slipped through the smoke test here.
   #
-  # If you enable features that call out (geolocation tiles, alert e-mail/SMTP,
-  # an MCP dependency), attach `nfsen` to a second, non-internal network instead
-  # of removing this one.
-  nfsen-net:
-    internal: true
+  # Block egress at the firewall instead (Docker's DOCKER-USER chain, or
+  # firewall/nftables-nfsen.nft) if that is what you want.
+  nfsen-net: {}

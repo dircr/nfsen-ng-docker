@@ -174,6 +174,28 @@ Ports are configured in `.env` — no need to edit `docker-compose.yaml`. `HTTPS
 
 The defaults are `8080`/`8443` rather than `80`/`443` because ports below 1024 can only be published by a **rootful** daemon (Docker Desktop, colima). With a rootless runtime (e.g. kiri) `docker compose up` fails with `Engine ports not published; ... Permission denied (os error 13)`. On a rootful daemon you can switch back to `80`/`443` in `.env`.
 
+### Reaching the UI from other machines (LAN)
+
+Three values change together. Changing only the first is the usual way to end up with a certificate warning and then a connection that fails outright:
+
+| Variable | Value | Why |
+|---|---|---|
+| `WEB_BIND_ADDR` | `10.0.0.171` | otherwise Docker publishes the port on loopback only |
+| `DOMAIN` | `10.0.0.171` | Caddy issues the certificate for *this* name; browsing an address while `DOMAIN=localhost` is a name mismatch |
+| `CADDY_DEFAULT_SNI` | `10.0.0.171` | **only for a bare IP**: browsers send no SNI for IP literals, so Caddy cannot pick a certificate and the handshake dies with `tlsv1 alert internal error` |
+
+```sh
+docker compose up -d --force-recreate caddy
+```
+
+**Better: use a name instead of the IP.** `DOMAIN=nfsen.lan` with a DNS record (or an `/etc/hosts` line on the clients) pointing at `10.0.0.171` needs no SNI workaround, matches the certificate without warnings once the root CA is trusted, and lets HSTS do something — browsers ignore HSTS for IP literals, so on a bare IP that header is silently dropped.
+
+Trusting the certificate (`tls internal`): copy `caddy-data/caddy/pki/authorities/local/root.crt` to the clients — on Linux into `/usr/local/share/ca-certificates/` followed by `update-ca-certificates`, on macOS into Keychain Access with "Always trust". Trust the **root**: the leaf is valid for 12 hours and rotates (see `openssl x509 -noout -dates` against the site), so pinning the leaf is a trap.
+
+`./scripts/smoke-test.sh` checks the combination above: with `DOMAIN` set to an IPv4 literal and no matching `CADDY_DEFAULT_SNI`, it fails with that hint instead of a TLS error.
+
+Remember that the UI is now visible to the whole LAN, and one shared password is its only protection — see [`docs/adr/0001-auth-and-collector-trust.md`](docs/adr/0001-auth-and-collector-trust.md) for the allowlist snippet and the alternatives.
+
 ## Upgrading from the v0.4 setup
 
 This repository used to build nfsen-ng **v0.4.0** on Apache + php-fpm. It now runs **1.0.0-beta.7**, where the whole UI — pages, static assets, SSE, import daemon — is one OpenSwoole process on port 9000. What that means in practice:
@@ -262,10 +284,10 @@ What this setup does and does not protect:
 - **One shared credential for the dashboard — no roles, no MFA, no revocation.** The options (status quo, `forward_auth` + an IdP, network identity, an IP allowlist) are compared in [`docs/adr/0001-auth-and-collector-trust.md`](docs/adr/0001-auth-and-collector-trust.md), with the exact Caddyfile change for the cheap one. This is the largest remaining gap in the stack and it is a product decision, not a bug.
 - **Basic auth is the only access control for the UI.** The `.env` file holds the password hash: `chmod 600 .env`. Basic auth credentials are sent on every request — TLS is what keeps them off the wire.
 - **`tls internal`** (the default) presents a self-signed certificate: encrypted, but not vouched for by a CA. Browsers warn, and users learn to click through warnings. For anything long-lived, use a real certificate (`DOMAIN` + Let's Encrypt, see above).
-- Containers run with `no-new-privileges`, `cap_drop: ALL` (only Caddy re-adds `NET_BIND_SERVICE`, to bind `:80`/`:443` inside its container), read-only root filesystem for the collector, and CPU/RAM/PID limits.
+- Containers run with `no-new-privileges`, `cap_drop: ALL` (only Caddy re-adds `NET_BIND_SERVICE`, to bind `:80`/`:443` inside its container), read-only root filesystem for the collector, and CPU/RAM/PID limits. Caddy's admin API is **off** — it is unauthenticated and would let anything inside its network namespace rewrite the whole proxy config; the healthcheck probes `:80` instead, so a config change needs `docker compose up -d --force-recreate caddy` rather than `caddy reload`.
 - **The UI process runs as uid 1000** — the same user as the collector, which owns the capture files, so reading them needs no capability; `cap_drop: ALL` leaves it with none at all. Its view of `profiles-data` is mounted **read-only**: the UI reads capture files and never writes them (no `nfexpire`, no `unlink`/`rmdir` on that path — checked against the app source), so a compromised UI cannot tamper with or delete the flow records the analysis rests on. Upgrading an existing install on Linux: `chown -R 1000:1000 nfsen-state` once, otherwise the app cannot write its SQLite store and RRD files.
 - The UI's port 9000 is not published: only Caddy reaches it, over the compose network. `sources.conf` is validated by both entrypoints before use — a device name becomes a directory name and an nfsen-ng source name.
-- **The compose network has no egress** (`nfsen-net` is `internal: true`). Nothing here needs the internet at runtime, so a compromised UI has nowhere to send captured flow data. Published ports still work — the daemon DNATs them straight to the container. Features that call out (geolocation tiles, alert e-mail, an MCP dependency) need a second, non-internal network for the `nfsen` service.
+- **Egress is not blocked by the network definition** — and that is deliberate, because Docker publishes no ports for containers on an `internal: true` network: they run, report healthy, and are unreachable from outside (`NetworkSettings.Ports` null for every port, no DNAT rule, no `docker-proxy`). If you want the UI container to be unable to reach the internet, block it at the firewall — Docker's `DOCKER-USER` chain, `firewall/nftables-nfsen.nft`, or the host's own policy — and keep the published ports working.
 - **Response headers:** `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Cross-Origin-Opener-Policy`/`-Resource-Policy`, `Permissions-Policy`, `X-Robots-Tag`, an enforced `Content-Security-Policy` (`object-src 'none'; base-uri 'self'; form-action 'self'`), the full policy in report-only mode, and `Strict-Transport-Security` for real hostnames only (never `localhost`, where it would pin a self-signed certificate for a year). Caddy's `Server` header is stripped. Caveat: Caddy applies these from a deferred handler, so **`401` responses — the ones an unauthenticated attacker sees — carry none of them and still say `Server: Caddy`**; do not treat the headers as protection for rejected requests.
 - **Not enabled by default:** nfsen-ng's read-only MCP endpoint (`NFSEN_MCP_HTTP=true` exposes `/_mcp` on port 9000). Treat access to it as equivalent to access to the dashboard.
 

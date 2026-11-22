@@ -1,0 +1,109 @@
+name: ci
+
+# What this guards, and why each step exists:
+#
+#   lint      — hadolint + shellcheck + `compose config` + the sources.conf
+#               validator. These are the same checks a human would run by hand;
+#               the repo already carried `# hadolint ignore=` annotations that
+#               nothing ever executed.
+#   build     — both images, from the pinned digests. A re-pointed upstream tag,
+#               a changed nfdump archive checksum, or a moved base image digest
+#               fails here rather than on a machine that is already running.
+#   smoke     — the full stack, with basic auth, exactly as documented. It is the
+#               only place where "the UI actually answers behind Caddy" is
+#               asserted automatically.
+#   scan/sbom — trivy on both images (HIGH/CRITICAL, unfixed ignored) plus a
+#               CycloneDX SBOM as an artifact, so a CVE in openswoole/librrd/
+#               nfdump can be looked up later instead of guessed at.
+#
+# Action versions are major tags on purpose: pinning by SHA is better, but the
+# SHAs cannot be verified from this repository, and a wrong SHA breaks CI
+# silently. If you want SHA pins, let Dependabot do it (it understands both).
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: hadolint (both Dockerfiles)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" hadolint/hadolint:latest \
+            hadolint /repo/nfdump/Dockerfile /repo/nfsen-ng/Dockerfile
+
+      - name: shellcheck (scripts + entrypoints)
+        run: |
+          docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:stable -x -S warning \
+            /mnt/scripts/validate-sources.sh \
+            /mnt/scripts/smoke-test.sh \
+            /mnt/scripts/watch-alerts.sh \
+            /mnt/nfdump/entrypoint.sh \
+            /mnt/nfsen-ng/entrypoint.sh
+
+      - name: sources.conf validator
+        run: ./scripts/validate-sources.sh conf/sources.conf
+
+      - name: compose file parses
+        run: |
+          cp .env.example .env      # only required vars; the hash is not used until runtime
+          docker compose config -q
+
+  build-and-verify:
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: generate a throwaway password hash
+        run: |
+          cp .env.example .env
+          hash="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext 'ci-password')"
+          # docker compose interpolates $ in .env, so every $ must be doubled
+          escaped="$(printf '%s' "$hash" | sed 's/\$/$$/g')"
+          sed -i "s|^AUTH_PASS_HASH=.*|AUTH_PASS_HASH=${escaped}|" .env
+          chmod 600 .env
+          # the containers run as uid 1000 (collector and UI alike)
+          mkdir -p profiles-data nfsen-state
+          sudo chown -R 1000:1000 profiles-data nfsen-state
+
+      - name: build
+        run: docker compose build
+
+      - name: smoke test (starts the stack, asserts, tears it down)
+        run: ./scripts/smoke-test.sh --password 'ci-password' --down
+
+      - name: container logs
+        if: failure()
+        run: docker compose logs --no-color | tail -200
+
+      - name: trivy (HIGH/CRITICAL, unfixed ignored)
+        run: |
+          for image in nfsen-ng-docker-nfsen nfsen-ng-docker-nfdump; do
+            docker save "$image:latest" -o "/tmp/$image.tar"
+            docker run --rm -v "/tmp/$image.tar:/img.tar:ro" aquasec/trivy:latest image \
+              --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --input /img.tar
+          done
+
+      - name: SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: nfsen-ng-docker-nfsen:latest
+          format: cyclonedx-json
+          artifact-name: nfsen-ng-docker.sbom.cdx.json
+          upload-artifact: true
+          # the stack is torn down by the smoke test; scan the local image store
+          registry-username: ""
+          registry-password: ""

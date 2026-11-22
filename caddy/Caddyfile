@@ -21,6 +21,25 @@
 	# automation is unaffected).
 	auto_https disable_redirects
 
+	# No admin API. It listens on localhost inside this container (not published,
+	# so not reachable from the LAN or from sibling containers) but it needs no
+	# authentication at all: anyone who ever gets into this network namespace —
+	# --network host, a published 2019, a debug sidecar — can rewrite the whole
+	# proxy config. It also logged a line every 30 s for the healthcheck. The
+	# healthcheck now probes :80 instead.
+	#
+	# Consequence: `caddy reload` no longer works — a config change needs
+	# `docker compose up -d --force-recreate caddy` (which is the reliable path
+	# anyway, see the stale-mount note in README).
+	admin off
+
+	# Certificate to present when the client sends no SNI. Browsers do not send
+	# SNI for a bare IP address, so with `DOMAIN` set to an IP (LAN deployment
+	# without DNS) Caddy cannot pick a certificate and the handshake fails with
+	# "tlsv1 alert internal error". Set CADDY_DEFAULT_SNI to that IP in .env.
+	# Harmless otherwise: with a hostname, SNI is always present.
+	default_sni {$CADDY_DEFAULT_SNI:localhost}
+
 	# HTTP/3 off: Caddy advertises ``alt-svc: h3=":443"`` using its *listener*
 	# port, but the host publishes 8443/tcp only — no UDP at all. Browsers would
 	# try QUIC on a port that is both unpublished and closed, then fall back.
